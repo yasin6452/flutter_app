@@ -1,122 +1,471 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:image/image.dart' as img;
 
 void main() {
-  runApp(const MyApp());
+  runApp(const PlantDiseaseApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class PlantDiseaseApp extends StatelessWidget {
+  const PlantDiseaseApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'تشخیص بیماری گیاهان',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        primarySwatch: Colors.green,
+        useMaterial3: true,
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const HomeScreen(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _HomeScreenState extends State<HomeScreen> {
+  File? _selectedImage;
+  String _result = '';
+  bool _isAnalyzing = false;
+  Interpreter? _interpreter;
+  final ImagePicker _picker = ImagePicker();
 
-  void _incrementCounter() {
+  // لیست کلاس‌های بیماری‌ها (باید با مدل خودت تطبیق بدی)
+  final List<String> _labels = [
+    'سالم',
+    'لکه برگی',
+    'زنگ زدگی',
+    'پژمردگی',
+    'بیماری قارچی',
+    // لیبل‌های دیگر رو اضافه کن
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadModel();
+  }
+
+  Future<void> _loadModel() async {
+    try {
+      _interpreter = await Interpreter.fromAsset(
+        'assets/plant_disease_model_float16.tflite',
+      );
+      print('✅ مدل با موفقیت بارگذاری شد');
+    } catch (e) {
+      print('❌ خطا در بارگذاری مدل: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('خطا در بارگذاری مدل: $e')),
+        );
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _interpreter?.close();
+    super.dispose();
+  }
+
+  Future<void> _pickFromCamera() async {
+    try {
+      final XFile? image = await _picker.pickImage(
+        source: ImageSource.camera,
+        maxWidth: 800,
+        maxHeight: 800,
+        imageQuality: 85,
+      );
+
+      if (image != null) {
+        setState(() {
+          _selectedImage = File(image.path);
+          _result = '';
+        });
+      }
+    } catch (e) {
+      _showError('خطا در باز کردن دوربین: $e');
+    }
+  }
+
+  Future<void> _pickFromGallery() async {
+    try {
+      final XFile? image = await _picker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 800,
+        maxHeight: 800,
+        imageQuality: 85,
+      );
+
+      if (image != null) {
+        setState(() {
+          _selectedImage = File(image.path);
+          _result = '';
+        });
+      }
+    } catch (e) {
+      _showError('خطا در باز کردن گالری: $e');
+    }
+  }
+
+  Future<void> _analyzeImage() async {
+    if (_selectedImage == null || _interpreter == null) {
+      _showError('لطفاً ابتدا یک تصویر انتخاب کنید');
+      return;
+    }
+
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _isAnalyzing = true;
+      _result = '';
     });
+
+    try {
+      // خواندن و پردازش تصویر
+      final imageBytes = await _selectedImage!.readAsBytes();
+      img.Image? image = img.decodeImage(imageBytes);
+
+      if (image == null) {
+        throw Exception('نمی‌توان تصویر را پردازش کرد');
+      }
+
+      // تغییر اندازه تصویر به سایز ورودی مدل (معمولاً 224x224)
+      final resizedImage = img.copyResize(image, width: 224, height: 224);
+
+      // تبدیل به فرمت ورودی مدل
+      var input = _imageToByteListFloat32(resizedImage, 224);
+
+      // آماده‌سازی خروجی
+      var output = List.filled(_labels.length, 0.0).reshape([1, _labels.length]);
+
+      // اجرای مدل
+      _interpreter!.run(input, output);
+
+      // پیدا کردن بیشترین احتمال
+      List<double> probabilities = output[0];
+      int maxIndex = 0;
+      double maxProb = probabilities[0];
+
+      for (int i = 1; i < probabilities.length; i++) {
+        if (probabilities[i] > maxProb) {
+          maxProb = probabilities[i];
+          maxIndex = i;
+        }
+      }
+
+      // نمایش نتیجه
+      String labelName = maxIndex < _labels.length 
+          ? _labels[maxIndex] 
+          : 'کلاس $maxIndex';
+      
+      setState(() {
+        _isAnalyzing = false;
+        _result = '''
+🌱 نتیجه تشخیص:
+
+📊 بیماری شناسایی شده: $labelName
+
+📈 میزان اطمینان: ${(maxProb * 100).toStringAsFixed(1)}%
+
+${maxProb > 0.7 ? '✅ تشخیص با اطمینان بالا' : '⚠️ لطفاً تصویر واضح‌تری ارسال کنید'}
+
+${_getRecommendation(labelName)}
+        ''';
+      });
+    } catch (e) {
+      setState(() {
+        _isAnalyzing = false;
+      });
+      _showError('خطا در تحلیل تصویر: $e');
+    }
+  }
+
+  List<List<List<List<double>>>> _imageToByteListFloat32(
+    img.Image image, 
+    int inputSize,
+  ) {
+    var convertedBytes = List.generate(
+      1,
+      (index) => List.generate(
+        inputSize,
+        (y) => List.generate(
+          inputSize,
+          (x) {
+            final pixel = image.getPixel(x, y);
+            return [
+              pixel.r / 255.0,
+              pixel.g / 255.0,
+              pixel.b / 255.0,
+            ];
+          },
+        ),
+      ),
+    );
+    return convertedBytes;
+  }
+
+  String _getRecommendation(String disease) {
+    switch (disease) {
+      case 'سالم':
+        return '💚 گیاه سالم است! ادامه دهید.';
+      case 'لکه برگی':
+        return '💊 توصیه: استفاده از قارچ‌کش مناسب و حذف برگ‌های آلوده';
+      case 'زنگ زدگی':
+        return '💊 توصیه: سمپاشی با مس و بهبود تهویه';
+      case 'پژمردگی':
+        return '💊 توصیه: بررسی آبیاری و سیستم ریشه';
+      default:
+        return '📖 مراجعه به متخصص کشاورزی توصیه می‌شود';
+    }
+  }
+
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.red,
+        duration: const Duration(seconds: 3),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text(
+          'تشخیص بیماری گیاهان',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        centerTitle: true,
+        elevation: 0,
+        backgroundColor: Colors.green.shade700,
+        foregroundColor: Colors.white,
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+      body: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Colors.green.shade700, Colors.green.shade50],
+          ),
+        ),
+        child: SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Logo/Icon Section
+                Container(
+                  height: 120,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    shape: BoxShape.circle,
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.1),
+                        blurRadius: 20,
+                        offset: const Offset(0, 10),
+                      ),
+                    ],
+                  ),
+                  child: Icon(
+                    Icons.eco,
+                    size: 60,
+                    color: Colors.green.shade700,
+                  ),
+                ),
+                const SizedBox(height: 30),
+
+                // Image Preview Card
+                Card(
+                  elevation: 8,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Container(
+                    height: 300,
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade200,
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: _selectedImage == null
+                        ? Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                Icons.image_outlined,
+                                size: 80,
+                                color: Colors.grey.shade400,
+                              ),
+                              const SizedBox(height: 16),
+                              Text(
+                                'هنوز تصویری انتخاب نشده',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  color: Colors.grey.shade600,
+                                ),
+                              ),
+                            ],
+                          )
+                        : ClipRRect(
+                            borderRadius: BorderRadius.circular(20),
+                            child: Image.file(
+                              _selectedImage!,
+                              fit: BoxFit.cover,
+                            ),
+                          ),
+                  ),
+                ),
+                const SizedBox(height: 30),
+
+                // Action Buttons
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: _isAnalyzing ? null : _pickFromCamera,
+                        icon: const Icon(Icons.camera_alt, size: 28),
+                        label: const Text(
+                          'دوربین',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green.shade600,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(15),
+                          ),
+                          elevation: 5,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: _isAnalyzing ? null : _pickFromGallery,
+                        icon: const Icon(Icons.photo_library, size: 28),
+                        label: const Text(
+                          'گالری',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.blue.shade600,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(15),
+                          ),
+                          elevation: 5,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 20),
+
+                // Analyze Button
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    onPressed: _selectedImage != null && !_isAnalyzing
+                        ? _analyzeImage
+                        : null,
+                    icon: _isAnalyzing
+                        ? const SizedBox(
+                            width: 24,
+                            height: 24,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : const Icon(Icons.search, size: 28),
+                    label: Text(
+                      _isAnalyzing ? 'در حال تحلیل...' : 'تحلیل تصویر',
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.orange.shade600,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 18),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(15),
+                      ),
+                      elevation: 5,
+                      disabledBackgroundColor: Colors.grey.shade400,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 30),
+
+                // Result Section
+                if (_result.isNotEmpty)
+                  Card(
+                    elevation: 5,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(15),
+                    ),
+                    color: Colors.white,
+                    child: Padding(
+                      padding: const EdgeInsets.all(20),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(
+                                Icons.analytics,
+                                color: Colors.green.shade700,
+                                size: 28,
+                              ),
+                              const SizedBox(width: 12),
+                              const Text(
+                                'نتیجه تحلیل:',
+                                style: TextStyle(
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const Divider(height: 24),
+                          Text(
+                            _result,
+                            style: TextStyle(
+                              fontSize: 16,
+                              color: Colors.grey.shade800,
+                              height: 1.6,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
             ),
-          ],
+          ),
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
     );
   }
 }
